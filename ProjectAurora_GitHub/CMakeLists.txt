@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(ProjectAurora VERSION 0.1.0 LANGUAGES CXX)
+project(ProjectAurora VERSION 0.1.0 LANGUAGES C CXX)
 
 if(NOT DEFINED JUCE_DIR OR NOT EXISTS "${JUCE_DIR}/CMakeLists.txt")
     message(FATAL_ERROR "JUCE_DIR must point to a JUCE checkout containing CMakeLists.txt")
