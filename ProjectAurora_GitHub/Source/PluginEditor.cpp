@@ -52,7 +52,14 @@ void ProjectAuroraAudioProcessorEditor::paint(juce::Graphics& g)
     g.fillRoundedRectangle(18.0f, 18.0f, 5.0f, 48.0f, 2.5f);
     g.setColour(juce::Colour(0xff272c3a));
     g.drawRoundedRectangle(getLocalBounds().toFloat().reduced(1.0f), 12.0f, 1.0f);
-    g.drawRoundedRectangle(18.0f, 83.0f, static_cast<float>(getWidth() - 36), 72.0f, 9.0f);
+   g.drawRoundedRectangle(
+    18.0f,
+    83.0f,
+    static_cast<float>(getWidth() - 36),
+    72.0f,
+    9.0f,
+    1.5f
+);
 }
 
 void ProjectAuroraAudioProcessorEditor::resized()
