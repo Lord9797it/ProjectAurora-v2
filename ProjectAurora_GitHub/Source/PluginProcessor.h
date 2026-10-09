@@ -70,6 +70,7 @@ private:
     float detectedMidi = -1.0f;
     int targetMidi = -1;
     float targetShiftSemitones = 0.0f;
+    float currentShiftSemitones = 0.0f;
     int samplesSinceValidDetection = 0;
     bool pitchActive = false;
     std::array<SimplePitchShifter, 2> shifters;
