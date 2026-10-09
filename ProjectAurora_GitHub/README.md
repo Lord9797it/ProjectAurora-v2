@@ -17,3 +17,8 @@ The root workflow builds the VST3 on Windows. Pushes to main, pull requests targ
 ## Limits
 
 This remains an experimental monophonic pitch shifter. It does not preserve formants, and large corrections, breathy/noisy input, polyphonic material, or octave errors can still sound unnatural. It has not been evaluated against the user's recording because no audio sample was available.
+
+
+## Pitch engine
+
+The correction path uses time-domain PSOLA (pitch-synchronous overlap-add) for voiced, monophonic material. Pitch-synchronous grains are normalized while overlapping; unvoiced consonants and very small corrections crossfade to a latency-matched dry path. The reported latency is recalculated during prepare from the sample rate and pitch range so the grain lookahead remains available.

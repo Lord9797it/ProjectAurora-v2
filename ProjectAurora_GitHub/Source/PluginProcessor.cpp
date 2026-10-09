@@ -6,9 +6,8 @@
 
 namespace
 {
-constexpr int analysisWindowSize = 1024;
+constexpr int analysisWindowSize = 1536;
 constexpr int analysisHopSize = 256;
-constexpr int pitchShifterDelaySize = 1024;
 constexpr float minimumPitchHz = 65.0f;
 constexpr float maximumPitchHz = 1000.0f;
 constexpr float minimumRms = 0.004f;
@@ -59,10 +58,17 @@ void ProjectAuroraAudioProcessor::prepareToPlay(double sampleRate, int samplesPe
     targetShiftSemitones = 0.0f;
     samplesSinceValidDetection = static_cast<int>(sampleRate * 2.0);
     pitchActive = false;
+    currentVoiced = false;
+
+    const int analysisCentreDelay = (analysisBufferSize * analysisDecimationFactor) / 2;
+    const int minimumPitchPeriod = static_cast<int>(std::ceil(sampleRate / minimumPitchHz));
+    const int psolaLookAhead = juce::jmax(analysisCentreDelay,
+        static_cast<int>(std::ceil(static_cast<float>(minimumPitchPeriod) * 1.8f)));
+    const int psolaLatency = psolaLookAhead * 2;
 
     for (auto& shifter : shifters)
     {
-        shifter.prepare(pitchShifterDelaySize);
+        shifter.prepare(sampleRate, psolaLookAhead, psolaLatency);
         shifter.reset();
     }
 
@@ -74,8 +80,8 @@ void ProjectAuroraAudioProcessor::prepareToPlay(double sampleRate, int samplesPe
     targetMidiAtomic.store(-1);
     correctionCents.store(0.0f);
 
-    // The dual-head shifter is centred around this fixed delay; the dry path uses the same delay.
-    setLatencySamples(pitchShifterDelaySize / 2);
+    // PSOLA uses lookahead to place pitch-synchronous grains without truncating their future half.
+    setLatencySamples(psolaLatency);
     juce::ignoreUnused(samplesPerBlock);
 }
 
@@ -88,77 +94,145 @@ bool ProjectAuroraAudioProcessor::isBusesLayoutSupported(const BusesLayout& layo
     return in == out && (out == juce::AudioChannelSet::mono() || out == juce::AudioChannelSet::stereo());
 }
 
-void ProjectAuroraAudioProcessor::SimplePitchShifter::prepare(int delayLength)
+void ProjectAuroraAudioProcessor::PsolaPitchShifter::prepare(double sampleRate, int lookAhead, int latency)
 {
-    delaySize = juce::jmax(256, delayLength);
-    buffer.assign(static_cast<size_t>(delaySize), 0.0f);
+    currentSampleRate = sampleRate;
+    lookAheadSamples = juce::jmax(1, lookAhead);
+    latencySamples = juce::jmax(lookAheadSamples * 2, latency);
+
+    const int maximumPeriod = static_cast<int>(std::ceil(sampleRate / minimumPitchHz));
+    historySize = latencySamples + maximumPeriod * 4 + 64;
+    outputSize = historySize;
+
+    audioHistory.assign(static_cast<size_t>(historySize), 0.0f);
+    monoHistory.assign(static_cast<size_t>(historySize), 0.0f);
+    outputSum.assign(static_cast<size_t>(outputSize), 0.0f);
+    outputWeight.assign(static_cast<size_t>(outputSize), 0.0f);
+    wetMixBuffer.assign(static_cast<size_t>(outputSize), 0.0f);
     reset();
 }
 
-void ProjectAuroraAudioProcessor::SimplePitchShifter::reset()
+void ProjectAuroraAudioProcessor::PsolaPitchShifter::reset()
 {
-    std::fill(buffer.begin(), buffer.end(), 0.0f);
-    writeIndex = 0;
-    phase = 0.0f;
+    std::fill(audioHistory.begin(), audioHistory.end(), 0.0f);
+    std::fill(monoHistory.begin(), monoHistory.end(), 0.0f);
+    std::fill(outputSum.begin(), outputSum.end(), 0.0f);
+    std::fill(outputWeight.begin(), outputWeight.end(), 0.0f);
+    std::fill(wetMixBuffer.begin(), wetMixBuffer.end(), 0.0f);
+    historyWriteIndex = 0;
+    outputReadIndex = 0;
+    synthesisPhase = 0.0f;
+    wetMix = 0.0f;
 }
 
-float ProjectAuroraAudioProcessor::SimplePitchShifter::readDelay(float delay) const
+int ProjectAuroraAudioProcessor::PsolaPitchShifter::wrapIndex(int index, int size) const
 {
-    if (buffer.empty())
+    int wrapped = index % size;
+    if (wrapped < 0)
+        wrapped += size;
+    return wrapped;
+}
+
+float ProjectAuroraAudioProcessor::PsolaPitchShifter::readHistory(
+    const std::vector<float>& history, int delay) const
+{
+    if (history.empty())
         return 0.0f;
 
-    delay = juce::jlimit(2.0f, static_cast<float>(delaySize - 3), delay);
-    float position = static_cast<float>(writeIndex) - delay;
-    while (position < 0.0f)
-        position += static_cast<float>(delaySize);
-
-    const int i1 = static_cast<int>(std::floor(position)) % delaySize;
-    const int i0 = (i1 + delaySize - 1) % delaySize;
-    const int i2 = (i1 + 1) % delaySize;
-    const int i3 = (i1 + 2) % delaySize;
-    const float fraction = position - std::floor(position);
-    const float y0 = buffer[static_cast<size_t>(i0)];
-    const float y1 = buffer[static_cast<size_t>(i1)];
-    const float y2 = buffer[static_cast<size_t>(i2)];
-    const float y3 = buffer[static_cast<size_t>(i3)];
-
-    // Cubic interpolation reduces the high-frequency loss of a linear read head.
-    const float c1 = 0.5f * (y2 - y0);
-    const float c2 = y0 - 2.5f * y1 + 2.0f * y2 - 0.5f * y3;
-    const float c3 = 0.5f * (y3 - y0) + 1.5f * (y1 - y2);
-    return ((c3 * fraction + c2) * fraction + c1) * fraction + y1;
+    delay = juce::jlimit(0, historySize - 1, delay);
+    const int index = wrapIndex(historyWriteIndex - delay, historySize);
+    return history[static_cast<size_t>(index)];
 }
 
-float ProjectAuroraAudioProcessor::SimplePitchShifter::process(float input, float ratio)
+void ProjectAuroraAudioProcessor::PsolaPitchShifter::addGrain(int markOffset, float periodSamples)
 {
-    if (buffer.empty())
+    if (outputSize == 0 || historySize == 0)
+        return;
+
+    constexpr float halfWindowPeriods = 1.25f;
+    const int halfWindow = juce::jlimit(2, historySize / 4,
+        static_cast<int>(std::ceil(periodSamples * halfWindowPeriods)));
+    const int outputCentre = wrapIndex(outputReadIndex + lookAheadSamples, outputSize);
+
+    for (int offset = -halfWindow; offset <= halfWindow; ++offset)
+    {
+        const int sourceDelay = lookAheadSamples - markOffset - offset;
+        const float source = readHistory(audioHistory, sourceDelay);
+        const float phase = static_cast<float>(offset) / static_cast<float>(halfWindow);
+        const float window = 0.5f + 0.5f * std::cos(juce::MathConstants<float>::pi * phase);
+        const int destination = wrapIndex(outputCentre + offset, outputSize);
+        outputSum[static_cast<size_t>(destination)] += source * window;
+        outputWeight[static_cast<size_t>(destination)] += window;
+    }
+}
+
+float ProjectAuroraAudioProcessor::PsolaPitchShifter::process(
+    float input, float mono, float pitchHz, float ratio, float shiftSemitones, bool voiced)
+{
+    if (historySize <= 0 || outputSize <= 0)
         return input;
 
-    buffer[static_cast<size_t>(writeIndex)] = input;
-    ratio = juce::jlimit(0.5f, 2.0f, ratio);
-    float output = readDelay(static_cast<float>(delaySize) * 0.5f);
+    audioHistory[static_cast<size_t>(historyWriteIndex)] = input;
+    monoHistory[static_cast<size_t>(historyWriteIndex)] = mono;
 
-    if (std::abs(1.0f - ratio) >= 0.0005f)
+    const float safePitchHz = juce::jlimit(minimumPitchHz, maximumPitchHz,
+        pitchHz > 0.0f ? pitchHz : minimumPitchHz);
+    const float periodSamples = static_cast<float>(currentSampleRate) / safePitchHz;
+    const float targetWet = voiced
+        ? juce::jlimit(0.0f, 1.0f, (std::abs(shiftSemitones) - 0.025f) / 0.20f)
+        : 0.0f;
+    const float wetCoefficient = 1.0f - std::exp(-1.0f /
+        static_cast<float>(currentSampleRate * (targetWet > wetMix ? 0.004 : 0.012)));
+    wetMix += (targetWet - wetMix) * wetCoefficient;
+
+    // q is H samples ahead of the current output slot; its source is L samples behind q.
+    const int mixDestination = wrapIndex(outputReadIndex + lookAheadSamples, outputSize);
+    wetMixBuffer[static_cast<size_t>(mixDestination)] = wetMix;
+
+    if (voiced && targetWet > 0.0f && pitchHz >= minimumPitchHz && pitchHz <= maximumPitchHz)
     {
-        phase += (1.0f - ratio) / static_cast<float>(delaySize - 64);
-        if (phase >= 1.0f)
-            phase -= 1.0f;
-        else if (phase < 0.0f)
-            phase += 1.0f;
+        const float shiftedHz = pitchHz * juce::jlimit(0.5f, 2.0f, ratio);
+        synthesisPhase += shiftedHz / static_cast<float>(currentSampleRate);
+        while (synthesisPhase >= 1.0f)
+        {
+            synthesisPhase -= 1.0f;
 
-        const float phaseB = phase < 0.5f ? phase + 0.5f : phase - 0.5f;
-        const float delayA = 32.0f + phase * static_cast<float>(delaySize - 64);
-        const float delayB = 32.0f + phaseB * static_cast<float>(delaySize - 64);
-        const float a = readDelay(delayA);
-        const float b = readDelay(delayB);
-
-        // Each head reaches zero gain exactly where its delay wraps to the start.
-        const float weightA = 0.5f - 0.5f * std::cos(juce::MathConstants<float>::twoPi * phase);
-        const float weightB = 1.0f - weightA;
-        output = a * weightA + b * weightB;
+            // Align each analysis grain to the strongest positive peak near the expected input period.
+            const int searchRadius = juce::jmax(1, static_cast<int>(std::lround(periodSamples * 0.5f)));
+            int markOffset = 0;
+            float strongestPeak = -std::numeric_limits<float>::max();
+            for (int offset = -searchRadius; offset <= searchRadius; ++offset)
+            {
+                const float candidate = readHistory(monoHistory, lookAheadSamples - offset);
+                if (candidate > strongestPeak)
+                {
+                    strongestPeak = candidate;
+                    markOffset = offset;
+                }
+            }
+            addGrain(markOffset, periodSamples);
+        }
+    }
+    else if (!voiced)
+    {
+        // Pitch phase is undefined on consonants; restart cleanly for the next voiced section.
+        synthesisPhase = 0.0f;
     }
 
-    writeIndex = (writeIndex + 1) % delaySize;
+    const float dry = readHistory(audioHistory, latencySamples);
+    const float weight = outputWeight[static_cast<size_t>(outputReadIndex)];
+    const float wet = weight > 1.0e-6f
+        ? outputSum[static_cast<size_t>(outputReadIndex)] / weight
+        : dry;
+    const float mix = wetMixBuffer[static_cast<size_t>(outputReadIndex)];
+    const float output = dry + (wet - dry) * mix;
+
+    outputSum[static_cast<size_t>(outputReadIndex)] = 0.0f;
+    outputWeight[static_cast<size_t>(outputReadIndex)] = 0.0f;
+    wetMixBuffer[static_cast<size_t>(outputReadIndex)] = 0.0f;
+
+    historyWriteIndex = (historyWriteIndex + 1) % historySize;
+    outputReadIndex = (outputReadIndex + 1) % outputSize;
     return output;
 }
 
@@ -317,6 +391,7 @@ void ProjectAuroraAudioProcessor::analysePitch(float sample)
 
     if (detectedMidi >= 0.0f)
     {
+        currentVoiced = true;
         const int root = static_cast<int>(parameters.getRawParameterValue("KEY")->load());
         const int scale = static_cast<int>(parameters.getRawParameterValue("SCALE")->load());
         targetMidi = quantizeMidiNote(detectedMidi, root, scale);
@@ -328,6 +403,7 @@ void ProjectAuroraAudioProcessor::analysePitch(float sample)
     }
     else
     {
+        currentVoiced = false;
         samplesSinceValidDetection = juce::jmin(
             samplesSinceValidDetection + analysisHopSize * analysisDecimationFactor,
             static_cast<int>(currentSampleRate * 2.0));
@@ -337,6 +413,7 @@ void ProjectAuroraAudioProcessor::analysePitch(float sample)
         {
             pitchActive = false;
             targetShiftSemitones = 0.0f;
+            detectedMidi = -1.0f;
             detectedMidiAtomic.store(-1);
             targetMidiAtomic.store(-1);
         }
@@ -383,6 +460,10 @@ void ProjectAuroraAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer,
 
         correctionCents.store(currentShiftSemitones * 100.0f);
         const float ratio = std::exp2(currentShiftSemitones / 12.0f);
+        const float pitchHz = detectedMidi >= 0.0f
+            ? static_cast<float>(440.0 * std::exp2((static_cast<double>(detectedMidi) - 69.0) / 12.0))
+            : 0.0f;
+        const bool voiced = currentVoiced;
         const float inputLevel = inputGain.getNextValue();
         const float outputLevel = outputGain.getNextValue();
 
@@ -390,7 +471,8 @@ void ProjectAuroraAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer,
         {
             float* data = buffer.getWritePointer(ch);
             const float in = data[i] * inputLevel;
-            data[i] = shifters[static_cast<size_t>(juce::jmin(ch, 1))].process(in, ratio) * outputLevel;
+            data[i] = shifters[static_cast<size_t>(juce::jmin(ch, 1))]
+                .process(in, mono * inputLevel, pitchHz, ratio, currentShiftSemitones, voiced) * outputLevel;
         }
     }
 }

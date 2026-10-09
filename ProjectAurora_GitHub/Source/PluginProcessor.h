@@ -35,19 +35,32 @@ public:
     float getCorrectionCents() const { return correctionCents.load(); }
 
 private:
-    class SimplePitchShifter
+    class PsolaPitchShifter
     {
     public:
-        void prepare(int delayLength);
+        void prepare(double sampleRate, int lookAhead, int latency);
         void reset();
-        float process(float input, float ratio);
+        float process(float input, float mono, float pitchHz, float ratio, float shiftSemitones, bool voiced);
 
     private:
-        float readDelay(float delay) const;
-        std::vector<float> buffer;
-        int writeIndex = 0;
-        float phase = 0.0f;
-        int delaySize = 1024;
+        int wrapIndex(int index, int size) const;
+        float readHistory(const std::vector<float>& history, int delay) const;
+        void addGrain(int markOffset, float periodSamples);
+
+        double currentSampleRate = 44100.0;
+        int lookAheadSamples = 0;
+        int latencySamples = 0;
+        int historySize = 0;
+        int outputSize = 0;
+        int historyWriteIndex = 0;
+        int outputReadIndex = 0;
+        float synthesisPhase = 0.0f;
+        float wetMix = 0.0f;
+        std::vector<float> audioHistory;
+        std::vector<float> monoHistory;
+        std::vector<float> outputSum;
+        std::vector<float> outputWeight;
+        std::vector<float> wetMixBuffer;
     };
 
     void analysePitch(float sample);
@@ -55,9 +68,8 @@ private:
     static float detectMidiNote(const float* samples, int count, double sampleRate);
     static juce::String noteName(int midiNote);
 
-    static constexpr int analysisBufferSize = 1024;
+    static constexpr int analysisBufferSize = 1536;
     static constexpr int analysisHopSize = 256;
-    static constexpr int pitchShifterDelaySize = 1024;
 
     double currentSampleRate = 44100.0;
     int analysisDecimationFactor = 2;
@@ -73,7 +85,8 @@ private:
     float currentShiftSemitones = 0.0f;
     int samplesSinceValidDetection = 0;
     bool pitchActive = false;
-    std::array<SimplePitchShifter, 2> shifters;
+    bool currentVoiced = false;
+    std::array<PsolaPitchShifter, 2> shifters;
     std::atomic<float> correctionCents { 0.0f };
     std::atomic<int> detectedMidiAtomic { -1 };
     std::atomic<int> targetMidiAtomic { -1 };
