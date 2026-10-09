@@ -1,0 +1,34 @@
+name: Build Project Aurora VST3
+
+on:
+workflow_dispatch:
+push:
+branches:
+- main
+
+jobs:
+build:
+runs-on: windows-latest
+
+steps:
+  - name: Checkout repository
+    uses: actions/checkout@v4
+
+  - name: Download JUCE
+    uses: actions/checkout@v4
+    with:
+      repository: juce-framework/JUCE
+      path: JUCE
+
+  - name: Configure project
+    run: cmake -S ProjectAurora_GitHub -B build -DJUCE_DIR="${{ github.workspace }}/JUCE" -DCMAKE_BUILD_TYPE=Release
+
+  - name: Compile VST3
+    run: cmake --build build --config Release --target ProjectAurora_VST3 --parallel 2
+
+  - name: Upload compiled plugin
+    uses: actions/upload-artifact@v4
+    with:
+      name: Project-Aurora-VST3-Windows
+      path: build/ProjectAurora_artefacts/Release/VST3/
+      if-no-files-found: error
