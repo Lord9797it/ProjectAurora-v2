@@ -1,1 +1,32 @@
+name: Build Project Aurora VST3
 
+on:
+workflow_dispatch:
+push:
+branches: [main, master]
+
+jobs:
+build:
+runs-on: windows-latest
+
+steps:
+  - name: Checkout Project Aurora
+    uses: actions/checkout@v4
+
+  - name: Checkout JUCE
+    uses: actions/checkout@v4
+    with:
+      repository: juce-framework/JUCE
+      path: JUCE
+
+  - name: Configure CMake
+    run: cmake -S . -B build -DJUCE_DIR="${{ github.workspace }}/JUCE" -DCMAKE_BUILD_TYPE=Release
+
+  - name: Build VST3
+    run: cmake --build build --config Release --target ProjectAurora_VST3
+
+  - name: Upload VST3
+    uses: actions/upload-artifact@v4
+    with:
+      name: Project-Aurora-VST3-Windows
+      path: build/ProjectAurora_artefacts/Release/VST3/
