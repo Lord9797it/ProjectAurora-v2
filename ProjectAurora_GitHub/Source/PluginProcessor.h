@@ -38,29 +38,40 @@ private:
     class SimplePitchShifter
     {
     public:
-        void prepare(int maxDelay);
+        void prepare(int delayLength);
         void reset();
         float process(float input, float ratio);
+
     private:
+        float readDelay(float delay) const;
         std::vector<float> buffer;
         int writeIndex = 0;
         float phase = 0.0f;
-        int delaySize = 2048;
+        int delaySize = 1024;
     };
 
     void analysePitch(float sample);
-    int quantizeMidiNote(int midiNote, int root, int scale) const;
-    static int detectMidiNote(const float* samples, int count, double sampleRate);
+    int quantizeMidiNote(float midiNote, int root, int scale) const;
+    static float detectMidiNote(const float* samples, int count, double sampleRate);
     static juce::String noteName(int midiNote);
 
+    static constexpr int analysisBufferSize = 1024;
+    static constexpr int analysisHopSize = 256;
+    static constexpr int pitchShifterDelaySize = 1024;
+
     double currentSampleRate = 44100.0;
-    std::vector<float> analysisBuffer;
+    int analysisDecimationFactor = 2;
+    int analysisDecimationCount = 0;
+    float analysisAccumulator = 0.0f;
+    std::array<float, analysisBufferSize> analysisBuffer {};
     int analysisWrite = 0;
     int samplesSinceAnalysis = 0;
     int analysisSamplesWritten = 0;
-    int detectedMidi = -1;
+    float detectedMidi = -1.0f;
     int targetMidi = -1;
-    float currentShiftSemitones = 0.0f;
+    float targetShiftSemitones = 0.0f;
+    int samplesSinceValidDetection = 0;
+    bool pitchActive = false;
     std::array<SimplePitchShifter, 2> shifters;
     std::atomic<float> correctionCents { 0.0f };
     std::atomic<int> detectedMidiAtomic { -1 };
